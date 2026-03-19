@@ -12,6 +12,9 @@
 #include <limits>
 #include <unordered_map>
 #include <stack>
+#include <fstream>
+#include <sstream>
+#include <set>
 
 const int SCREEN_WIDTH = 800;
 const int SCREEN_HEIGHT = 600;
@@ -649,13 +652,39 @@ private:
     std::shared_ptr<Material> material;
     std::shared_ptr<Shader> shader;
     
-public:
-    MeshRenderer(std::shared_ptr<Material> mat = std::make_shared<Material>(), 
-                 std::shared_ptr<Shader> sh = std::make_shared<LitShader>()) 
-        : material(mat), shader(sh) {
-        createCubeMesh();
+    float boundingRadius;
+    
+    void computeBoundingRadius() {
+        boundingRadius = 0.0f;
+        for (const auto& v : vertices) {
+            float len = v.length();
+            if (len > boundingRadius) boundingRadius = len;
+        }
+        if (boundingRadius < 0.001f) boundingRadius = 1.0f;
     }
     
+public:
+    // Конструктор с возможностью загрузки модели из OBJ-файла
+    MeshRenderer(std::shared_ptr<Material> mat = std::make_shared<Material>(), 
+                 std::shared_ptr<Shader> sh = std::make_shared<LitShader>(),
+                 const std::string& modelPath = "") 
+        : material(mat), shader(sh) {
+        if (!modelPath.empty() && LoadFromOBJ(modelPath)) {
+            std::cout << "Loaded model: " << modelPath << std::endl;
+        } else {
+            createCubeMesh();
+            if (!modelPath.empty()) {
+                std::cerr << "Failed to load model: " << modelPath << ", using default cube." << std::endl;
+            }
+        }
+    }
+    
+    bool LoadModel(const std::string& path) {
+        return LoadFromOBJ(path);
+    }
+    
+    float getBoundingRadius() const { return boundingRadius; }
+
 private:
     void createCubeMesh() {
         vertices = {
@@ -673,8 +702,96 @@ private:
             {0,1}, {1,2}, {2,3}, {3,0}, {4,5}, {5,6}, {6,7}, {7,4},
             {0,4}, {1,5}, {2,6}, {3,7}
         };
+        
+        computeBoundingRadius();
     }
-    
+
+    // Загрузка модели из Wavefront OBJ (поддерживаются только вершины v и треугольные грани f)
+    bool LoadFromOBJ(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Cannot open file: " << filename << std::endl;
+            return false;
+        }
+
+        vertices.clear();
+        triangles.clear();
+        edges.clear();  // рёбра не вычисляем для загруженной модели
+
+        std::string line;
+        while (std::getline(file, line)) {
+            // Пропускаем пустые строки и комментарии
+            if (line.empty() || line[0] == '#') continue;
+
+            std::istringstream iss(line);
+            std::string prefix;
+            iss >> prefix;
+
+            if (prefix == "v") {
+                // Вершина: v x y z
+                float x, y, z;
+                if (iss >> x >> y >> z) {
+                    vertices.emplace_back(x, y, z);
+                } else {
+                    std::cerr << "Malformed vertex line: " << line << std::endl;
+                }
+            }
+            else if (prefix == "f") {
+                // Грань: f v1 v2 v3 ... (поддерживаем только треугольники или триангулируем многоугольники)
+                std::vector<int> indices;
+                std::string token;
+                while (iss >> token) {
+                    // Индекс может быть вида "v", "v/vt" или "v/vt/vn". Извлекаем только число до первого '/'
+                    size_t slashPos = token.find('/');
+                    std::string idxStr = (slashPos == std::string::npos) ? token : token.substr(0, slashPos);
+                    if (!idxStr.empty()) {
+                        int idx = std::stoi(idxStr) - 1;  // OBJ индексы с 1
+                        if (idx >= 0) indices.push_back(idx);
+                    }
+                }
+
+                // Если получено меньше 3 индексов – пропускаем
+                if (indices.size() < 3) {
+                    std::cerr << "Face with less than 3 vertices: " << line << std::endl;
+                    continue;
+                }
+
+                // Триангуляция веером: (0,1,2), (0,2,3), (0,3,4), ...
+                for (size_t i = 1; i < indices.size() - 1; ++i) {
+                    triangles.emplace_back(indices[0], indices[i], indices[i + 1]);
+                }
+            }
+            // Игнорируем остальные типы строк (vt, vn, и т.д.)
+        }
+
+        file.close();
+
+        if (vertices.empty() || triangles.empty()) {
+            std::cerr << "No valid geometry found in " << filename << std::endl;
+            return false;
+        }
+
+        computeBoundingRadius();
+
+        std::cout << "Loaded " << vertices.size() << " vertices, " << triangles.size() << " triangles from " << filename << std::endl;
+        return true;
+    }
+
+    // Опционально: вычисление рёбер из треугольников (если потребуется для отрисовки)
+    void computeEdges() {
+        std::set<std::pair<int, int>> edgeSet;
+        for (const auto& tri : triangles) {
+            int i1 = std::get<0>(tri);
+            int i2 = std::get<1>(tri);
+            int i3 = std::get<2>(tri);
+            // Добавляем каждое ребро (с меньшим индексом первым)
+            if (i1 < i2) edgeSet.insert({i1, i2}); else edgeSet.insert({i2, i1});
+            if (i2 < i3) edgeSet.insert({i2, i3}); else edgeSet.insert({i3, i2});
+            if (i3 < i1) edgeSet.insert({i3, i1}); else edgeSet.insert({i1, i3});
+        }
+        edges.assign(edgeSet.begin(), edgeSet.end());
+    }
+
 public:
     void SetMaterial(std::shared_ptr<Material> newMaterial) {
         material = newMaterial;
@@ -906,10 +1023,36 @@ public:
         return (worldPos - position).normalized();
     }
     
-    bool isInView(const Vector3& point, float radius = 1.0f) const {
-        Vector3 viewDir = getViewDirection(point);
-        float distance = (point - position).length();
-        return distance < 50.0f && viewDir.z > 0.1f;
+    bool isSphereInView(const Vector3& center, float radius) const {
+        Vector3 toCenter = center - position;
+        float distance = toCenter.length();
+        
+        // Дальняя плоскость отсечения
+        if (distance > 50.0f + radius) return false;
+        
+        // Если объект очень близко – считаем видимым
+        if (distance < 0.5f) return true;
+        
+        Vector3 dirToCenter = toCenter * (1.0f / distance);
+        Vector3 forward = getForward();
+        
+        // Проверка, что объект перед камерой
+        float dot = dirToCenter.dot(forward);
+        if (dot < 0.2f) return false;
+        
+        // Горизонтальный угол обзора (приблизительно 60 градусов)
+        Vector3 right = getRight();
+        float rightDot = dirToCenter.dot(right);
+        float horizHalfAngle = 1.0f;
+        if (fabs(rightDot) > horizHalfAngle + radius / distance) return false;
+        
+        // Вертикальный угол обзора (примерно 45 градусов)
+        Vector3 up = Vector3(0, 1, 0); // упрощённо
+        float upDot = dirToCenter.dot(up);
+        float vertHalfAngle = 0.8f;
+        if (fabs(upDot) > vertHalfAngle + radius / distance) return false;
+        
+        return true;
     }
 };
 
@@ -1157,6 +1300,13 @@ private:
         return w1 * z1 + w2 * z2 + w3 * z3;
     }
     
+    float computeScreenRadius(const Vector3& worldCenter, float radius, const Camera& camera) const {
+        Vector3 projected = project(worldCenter, camera);
+        if (projected.z <= 0.1f) return SCREEN_WIDTH;
+        float scale = 200.0f;
+        return (scale * radius) / projected.z;
+    }
+    
 public:
     RenderSystem(SDL_Window* window) {
         sdlRenderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
@@ -1226,20 +1376,38 @@ public:
     }
     
     void clear(const Color& color) {
-        uint32_t clearColor = (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
-        std::fill(pixels, pixels + SCREEN_WIDTH * SCREEN_HEIGHT, clearColor);
-        std::fill(zBuffer, zBuffer + SCREEN_WIDTH * SCREEN_HEIGHT, std::numeric_limits<float>::max());
+    // Рисуем градиент: сверху синий, снизу зелёный
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        float t = float(y) / SCREEN_HEIGHT; // 0 вверху, 1 внизу
+        uint8_t r = uint8_t(100 + 100 * t); // от 100 до 200
+        uint8_t g = uint8_t(150 + 100 * t);
+        uint8_t b = uint8_t(255 - 150 * t); // от 255 до 105
+        
+        uint32_t gradColor = (255 << 24) | (b << 16) | (g << 8) | r;
+        
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            pixels[y * SCREEN_WIDTH + x] = gradColor;
+            zBuffer[y * SCREEN_WIDTH + x] = std::numeric_limits<float>::max();
+        }
     }
+}
     
     void addToRenderQueue(Transform* transform, MeshRenderer* mesh, const Camera& camera) {
         if (!transform || !mesh) return;
-        
-        // Optimization: skip objects far from camera
-        if (!camera.isInView(transform->GetWorldPosition(), 2.0f)) {
-            return;
-        }
-        
-        float distance = (transform->GetWorldPosition() - camera.position).length();
+
+        Vector3 worldPos = transform->GetWorldPosition();
+        float radius = mesh->getBoundingRadius() * std::max({transform->GetWorldScale().x, 
+                                                              transform->GetWorldScale().y, 
+                                                              transform->GetWorldScale().z});
+
+        // Проверка видимости сферы
+        if (!camera.isSphereInView(worldPos, radius)) return;
+
+        // Проверка минимального размера на экране (меньше 3 пикселей – не рисуем)
+        float screenRadius = computeScreenRadius(worldPos, radius, camera);
+        if (screenRadius < 3.0f) return;
+
+        float distance = (worldPos - camera.position).length();
         renderQueue.emplace_back(transform, mesh, distance);
     }
     
@@ -1625,7 +1793,7 @@ public:
         }
     }
     
-    Vector3 project(const Vector3& point, const Camera& camera) {
+    Vector3 project(const Vector3& point, const Camera& camera) const {
         Vector3 translated = point - camera.position;
         
         Vector3 rotatedY = Vector3(
@@ -1761,30 +1929,30 @@ public:
     
 private:
     Vector3 screenToWorld(const Vector2& screenPos, const Camera& camera) {
-    float x = (screenPos.x - SCREEN_WIDTH / 2.0f) / 200.0f;
-    float y = (SCREEN_HEIGHT / 2.0f - screenPos.y) / 200.0f;
-    float z = 1.0f;
+        float x = (screenPos.x - SCREEN_WIDTH / 2.0f) / 200.0f;
+        float y = (SCREEN_HEIGHT / 2.0f - screenPos.y) / 200.0f;
+        float z = 1.0f;
 
-    Vector3 rayDirCam = Vector3(x, y, z).normalized();
+        Vector3 rayDirCam = Vector3(x, y, z).normalized();
 
-    float cosX = cos(-camera.rotation.x);
-    float sinX = sin(-camera.rotation.x);
-    Vector3 rotatedX = Vector3(
-        rayDirCam.x,
-        rayDirCam.y * cosX - rayDirCam.z * sinX,
-        rayDirCam.y * sinX + rayDirCam.z * cosX
-    );
+        float cosX = cos(-camera.rotation.x);
+        float sinX = sin(-camera.rotation.x);
+        Vector3 rotatedX = Vector3(
+            rayDirCam.x,
+            rayDirCam.y * cosX - rayDirCam.z * sinX,
+            rayDirCam.y * sinX + rayDirCam.z * cosX
+        );
 
-    float cosY = cos(-camera.rotation.y);
-    float sinY = sin(-camera.rotation.y);
-    Vector3 rotatedY = Vector3(
-        rotatedX.x * cosY + rotatedX.z * sinY,
-        rotatedX.y,
-        -rotatedX.x * sinY + rotatedX.z * cosY
-    );
+        float cosY = cos(-camera.rotation.y);
+        float sinY = sin(-camera.rotation.y);
+        Vector3 rotatedY = Vector3(
+            rotatedX.x * cosY + rotatedX.z * sinY,
+            rotatedX.y,
+            -rotatedX.x * sinY + rotatedX.z * cosY
+        );
 
-    return rotatedY.normalized();
-}
+        return rotatedY.normalized();
+    }
     
     bool rayTriangleIntersect(const Vector3& origin, const Vector3& dir,
                              const Vector3& v0, const Vector3& v1, const Vector3& v2,
@@ -1929,31 +2097,31 @@ public:
     }
     
     GameObject* selectObject(const Vector2& screenPos, const Camera& camera, RenderSystem& renderer) {
-    float closestDistance = std::numeric_limits<float>::max();
-    GameObject* closestObject = nullptr;
-    Vector3 hitPoint;
+        float closestDistance = std::numeric_limits<float>::max();
+        GameObject* closestObject = nullptr;
+        Vector3 hitPoint;
 
-    auto objects = getObjects();
-    for (auto obj : objects) {
-        MeshRenderer* mesh = obj->getComponent<MeshRenderer>();
-        if (mesh) {
-            Vector3 testHit;
-            if (renderer.raycast(screenPos, obj->transform, mesh, camera, testHit)) {
-                float distance = (testHit - camera.position).length();
-                if (distance < closestDistance) {
-                    closestDistance = distance;
-                    closestObject = obj;
-                    hitPoint = testHit;
+        auto objects = getObjects();
+        for (auto obj : objects) {
+            MeshRenderer* mesh = obj->getComponent<MeshRenderer>();
+            if (mesh) {
+                Vector3 testHit;
+                if (renderer.raycast(screenPos, obj->transform, mesh, camera, testHit)) {
+                    float distance = (testHit - camera.position).length();
+                    if (distance < closestDistance) {
+                        closestDistance = distance;
+                        closestObject = obj;
+                        hitPoint = testHit;
+                    }
                 }
             }
         }
+
+        // Выделяем найденный объект (или nullptr — снимает выделение)
+        selectObject(closestObject);
+
+        return selectedObject;
     }
-
-    // Выделяем найденный объект (или nullptr — снимет выделение)
-    selectObject(closestObject);
-
-    return selectedObject;
-}
     
     void moveSelectedObject(const Vector2& screenDelta, const Camera& camera) {
         if (!selectedObject) return;
@@ -1991,23 +2159,24 @@ public:
             obj->update();
         }
     }
+    
     void selectObject(GameObject* obj) {
-    if (selectedObject == obj) return;
+        if (selectedObject == obj) return;
 
-    // Снять выделение с предыдущего объекта
-    if (selectedObject) {
-        ObjectSelector* selector = selectedObject->getComponent<ObjectSelector>();
-        if (selector) selector->Deselect();
+        // Снять выделение с предыдущего объекта
+        if (selectedObject) {
+            ObjectSelector* selector = selectedObject->getComponent<ObjectSelector>();
+            if (selector) selector->Deselect();
+        }
+
+        selectedObject = obj;
+
+        // Выделить новый объект
+        if (selectedObject) {
+            ObjectSelector* selector = selectedObject->getComponent<ObjectSelector>();
+            if (selector) selector->Select();
+        }
     }
-
-    selectedObject = obj;
-
-    // Выделить новый объект
-    if (selectedObject) {
-        ObjectSelector* selector = selectedObject->getComponent<ObjectSelector>();
-        if (selector) selector->Select();
-    }
-}
     
     void clear() {
         selectedObject = nullptr;
@@ -2168,6 +2337,7 @@ int main() {
     Button clearButton(SCREEN_WIDTH - 160, 110, 150, 40, "CLEAR ALL", Color(255, 100, 100, 200));
     Button physicsButton(SCREEN_WIDTH - 160, 160, 150, 40, "PHYSICS ON", Color(100, 100, 255, 200));
     Button hierarchyButton(10, SCREEN_HEIGHT - 50, 150, 40, "SHOW HIERARCHY", Color(200, 100, 200, 200));
+    Button loadModelButton(SCREEN_WIDTH - 160, 210, 150, 40, "LOAD MODEL", Color(255, 200, 100, 200));
     
     bool physicsEnabled = false;
     bool objectMoving = false;
@@ -2235,6 +2405,20 @@ int main() {
                     physicsButton.text = physicsEnabled ? "PHYSICS OFF" : "PHYSICS ON";
                     uiHandled = true;
                 }
+                else if (loadModelButton.isPressed(touchX, touchY)) {
+                    GameObject* obj = scene.createGameObject();
+                    if (obj) {
+                        MeshRenderer* mesh = obj->getComponent<MeshRenderer>();
+                        if (mesh) {
+                            if (!mesh->LoadModel("monkey.obj")) {
+                                scene.returnObject(obj);
+                            } else {
+                                physics.RegisterPhysicsObject(obj);
+                            }
+                        }
+                    }
+                    uiHandled = true;
+                }
                 
                 if (!uiHandled) {
                     // Проверка джойстиков
@@ -2254,24 +2438,24 @@ int main() {
                 }
                 
                 if (!uiHandled && showHierarchy && touchX >= 10 && touchX <= 260 && touchY >= 200 && touchY <= SCREEN_HEIGHT - 60) {
-    uiHandled = true;
-    auto allObjects = scene.getAllObjectsInHierarchy();
-    int yPos = 230;
-    bool hit = false;
-    for (auto obj : allObjects) {
-        if (yPos > SCREEN_HEIGHT - 60) break;
-        if (touchY >= yPos && touchY < yPos + 20) {
-            scene.selectObject(obj);
-            hit = true;
-            break;
-        }
-        yPos += 20;
-    }
-    if (!hit) {
-        // Клик в пустую область панели — снимаем выделение
-        scene.selectObject(nullptr);
-    }
-}
+                    uiHandled = true;
+                    auto allObjects = scene.getAllObjectsInHierarchy();
+                    int yPos = 230;
+                    bool hit = false;
+                    for (auto obj : allObjects) {
+                        if (yPos > SCREEN_HEIGHT - 60) break;
+                        if (touchY >= yPos && touchY < yPos + 20) {
+                            scene.selectObject(obj);
+                            hit = true;
+                            break;
+                        }
+                        yPos += 20;
+                    }
+                    if (!hit) {
+                        // Клик в пустую область панели — снимаем выделение
+                        scene.selectObject(nullptr);
+                    }
+                }
                 
                 if (!uiHandled) {
                     // Попытка выделить объект в сцене
@@ -2351,6 +2535,7 @@ int main() {
         clearButton.draw(renderer);
         physicsButton.draw(renderer);
         hierarchyButton.draw(renderer);
+        loadModelButton.draw(renderer);
         
         // Статусы
         if (physicsEnabled) {
